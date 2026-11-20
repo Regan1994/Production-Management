@@ -5,7 +5,7 @@ import pytest
 
 from app import create_app as build_app
 from app.db import get_db
-from app.services import backup_database, create_assembly_worker, create_batch, create_machine_range, create_model, ensure_barcodes, format_datetime, format_duration, get_job, machine_ids_from_numbers, parse_payload, query_report, restore_database, scan, set_assembly_worker_active, set_setting, status_label, summarize_report_by_operator, verify_sqlite_backup
+from app.services import add_sales_order_line, assign_machine, backup_database, create_assembly_worker, create_batch, create_machine_range, create_model, create_sales_order, ensure_barcodes, format_datetime, format_duration, get_job, list_order_lines, machine_ids_from_numbers, mark_machine_painted, mark_machine_painted_by_serial, parse_payload, production_inventory, query_report, reassign_machine, restore_database, scan, set_assembly_worker_active, set_setting, status_label, summarize_report_by_operator, unassign_machine, verify_sqlite_backup
 
 
 def setup_data(app):
@@ -144,11 +144,313 @@ def test_five_axis_same_serial_can_be_created_once_per_stage(app):
         assert rotate_batch != tilt_batch
 
 
+def test_finished_standard_job_enters_traceable_production_inventory(app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        assert scan(payloads["START"])["result"] == "success"
+        assert scan(payloads["FINISH"])["result"] == "success"
+        summary, machines = production_inventory()
+        assert [(row["model_name_snapshot"], row["completed_count"], row["pending_paint_count"], row["available_count"]) for row in summary] == [("HR-255", 1, 1, 0)]
+        assert [row["product_serial"] for row in machines] == ["E27-01"]
+        assert get_db().execute("SELECT COUNT(*) FROM production_machine").fetchone()[0] == 1
+
+
+def test_five_axis_enters_inventory_only_after_all_four_stages_finish(app):
+    with app.app_context():
+        model_id = create_model("FHR-255CL", "FHR255CL", serial_prefix="F")
+        for stage in ("旋", "傾", "尾"):
+            batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator", stage)
+            ensure_barcodes(batch_id)
+            payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+            scan(payloads["START"])
+            scan(payloads["FINISH"])
+        assert production_inventory()[1] == []
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator", "組")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        summary, machines = production_inventory()
+        assert summary[0]["completed_count"] == 1
+        assert [row["product_serial"] for row in machines] == ["F27-01"]
+
+
+def test_production_management_page_shows_inventory(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        mark_machine_painted(production_inventory()[1][0]["id"], "2026-11-20", "admin")
+    page = client.get("/production-management").get_data(as_text=True)
+    assert "入庫機台紀錄" in page
+    assert "噴漆完成登記" in page
+    assert "機台號碼" in page
+    assert "請選擇有庫存的機型" in page
+    assert "請先從上方選擇有庫存的機型" in page
+    selected_page = client.get(f"/production-management?model_id={model_id}").get_data(as_text=True)
+    assert "已入庫、尚未配單" in selected_page
+    assert "HR-255" in selected_page and "1 台" in selected_page
+    assert "確認配單" not in selected_page
+    assert "選擇需求單" not in selected_page
+
+
+def test_paint_completion_can_be_registered_by_completed_machine_serial(app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine = mark_machine_painted_by_serial("e27-01", "2026-11-19", "admin")
+        assert machine["model_id"] == model_id
+        assert production_inventory()[1][0]["painted_at"] == "2026-11-19"
+        with pytest.raises(ValueError, match="已登記噴漆完成"):
+            mark_machine_painted_by_serial("E27-01", "2026-11-19", "admin")
+        with pytest.raises(ValueError, match="找不到已完成組裝"):
+            mark_machine_painted_by_serial("E27-99", "2026-11-19", "admin")
+
+
+def test_paint_completion_route_registers_machine_by_serial(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+    response = client.post("/production-management/paint-complete", data={"product_serial": "E27-01", "painted_at": "2026-11-19"}, follow_redirects=True)
+    assert response.status_code == 200
+    assert "E27-01（HR-255）已登記噴漆完成並入庫" in response.get_data(as_text=True)
+    with app.app_context():
+        assert production_inventory()[1][0]["painted_at"] == "2026-11-19"
+
+
+def test_order_assignment_page_can_assign_multiple_inventory_machines(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 2, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machines = production_inventory()[1]
+        for machine in machines:
+            mark_machine_painted(machine["id"], "2026-11-19", "admin")
+        order_id = create_sales_order("SO-BATCH", "", "admin", [(model_id, 2)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+        machine_ids = [str(machine["id"]) for machine in machines]
+    page = client.get(f"/orders/{order_id}/assignment")
+    assert page.status_code == 200
+    page_text = page.get_data(as_text=True)
+    assert "可用庫存 2 台" in page_text
+    assert "自動配單" in page_text and "確認自動配單" in page_text
+    response = client.post(f"/orders/{order_id}/lines/{line_id}/assign", data={"machine_id": machine_ids}, follow_redirects=True)
+    assert response.status_code == 200
+    assert "已將 2 台 HR-255 機台配給需求單 SO-BATCH" in response.get_data(as_text=True)
+    with app.app_context():
+        assert production_inventory()[0][0]["assigned_count"] == 2
+
+
+def test_order_page_only_lists_lines_that_still_need_assignment(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine = production_inventory()[1][0]
+        mark_machine_painted(machine["id"], "2026-11-19", "admin")
+        order_id = create_sales_order("SO-DONE", "", "admin", [(model_id, 1)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+        assign_machine(machine["id"], line_id, "admin")
+        assert list_order_lines(unassigned_only=True) == []
+    page = client.get("/orders").get_data(as_text=True)
+    assert "目前沒有待配訂單。" in page
+    completed_page = client.get("/orders?view=completed").get_data(as_text=True)
+    assert "SO-DONE" in completed_page and "已配完" in completed_page
+
+
+def test_order_assignment_unassignment_and_reassignment_keep_serial_history(app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine_id = production_inventory()[1][0]["id"]
+        mark_machine_painted(machine_id, "2026-11-19", "admin")
+        first_order = create_sales_order("SO-001", "", "admin")
+        add_sales_order_line(first_order, model_id, 1, "admin")
+        first_line = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (first_order,)).fetchone()[0]
+        first_assignment = assign_machine(machine_id, first_line, "admin")
+        assert production_inventory()[0][0]["available_count"] == 0
+        unassign_machine(first_assignment, "admin", "急單改配")
+        assert production_inventory()[0][0]["available_count"] == 1
+        second_order = create_sales_order("SO-002", "", "admin")
+        add_sales_order_line(second_order, model_id, 1, "admin")
+        second_line = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (second_order,)).fetchone()[0]
+        active_assignment = assign_machine(machine_id, first_line, "admin")
+        reassign_machine(active_assignment, second_line, "admin")
+        current = production_inventory()[1][0]
+        assert current["order_no"] == "SO-002"
+        history = get_db().execute("SELECT unassigned_at FROM machine_assignment WHERE machine_id=? ORDER BY id", (machine_id,)).fetchall()
+        assert len(history) == 3 and history[0]["unassigned_at"] and history[1]["unassigned_at"] and history[2]["unassigned_at"] is None
+
+
+def test_order_page_supports_multiple_models(client, app):
+    with app.app_context():
+        first_model = create_model("HR-255", "HR255", serial_prefix="E")
+        second_model = create_model("AR-210", "AR210", serial_prefix="C")
+    assert client.post("/orders", data={"order_no": "SO-MULTI"}).status_code == 302
+    with app.app_context():
+        order_id = get_db().execute("SELECT id FROM sales_order WHERE order_no='SO-MULTI'").fetchone()[0]
+    client.post(f"/orders/{order_id}/lines", data={"model_id": first_model, "required_qty": 2})
+    client.post(f"/orders/{order_id}/lines", data={"model_id": second_model, "required_qty": 3})
+    page = client.get("/orders").get_data(as_text=True)
+    assert "SO-MULTI" in page and "HR-255" in page and "AR-210" in page
+
+
+def test_order_creation_accepts_multiple_model_lines_at_once(client, app):
+    with app.app_context():
+        first_model = create_model("HR-255", "HR255", serial_prefix="E")
+        second_model = create_model("AR-210", "AR210", serial_prefix="C")
+    response = client.post("/orders", data={
+        "order_no": "SO-AT-ONCE",
+        "model_id": [str(first_model), str(second_model), ""],
+        "required_qty": ["2", "3", ""],
+    })
+    assert response.status_code == 302
+    with app.app_context():
+        lines = get_db().execute("SELECT model_id,required_qty FROM sales_order_line JOIN sales_order ON sales_order.id=sales_order_line.order_id WHERE sales_order.order_no='SO-AT-ONCE' ORDER BY model_id").fetchall()
+        assert [(row["model_id"], row["required_qty"]) for row in lines] == sorted([(first_model, 2), (second_model, 3)])
+
+
+def test_order_creation_stores_customer_and_expected_ship_date(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+    response = client.post("/orders", data={
+        "order_no": "SO-HEADER",
+        "customer_name": "大明公司",
+        "expected_ship_date": "2026-12-05",
+        "model_id": [str(model_id)],
+        "required_qty": ["1"],
+    })
+    assert response.status_code == 302
+    with app.app_context():
+        order = get_db().execute("SELECT customer_name,expected_ship_date FROM sales_order WHERE order_no='SO-HEADER'").fetchone()
+        assert tuple(order) == ("大明公司", "2026-12-05")
+
+
+def test_order_edit_updates_header_and_an_unassigned_model_line(client, app):
+    with app.app_context():
+        first_model = create_model("HR-255", "HR255", serial_prefix="E")
+        second_model = create_model("AR-210", "AR210", serial_prefix="C")
+        order_id = create_sales_order("SO-EDIT", "", "admin", [(first_model, 2)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+    assert client.post(f"/orders/{order_id}/update", data={"order_no": "SO-EDIT-NEW", "customer_name": "新客戶", "expected_ship_date": "2026-12-25"}).status_code == 302
+    assert client.post(f"/orders/{order_id}/lines/{line_id}/update", data={"model_id": str(second_model), "required_qty": "3"}).status_code == 302
+    with app.app_context():
+        order = get_db().execute("SELECT order_no,customer_name,expected_ship_date FROM sales_order WHERE id=?", (order_id,)).fetchone()
+        line = get_db().execute("SELECT model_id,required_qty FROM sales_order_line WHERE id=?", (line_id,)).fetchone()
+        assert tuple(order) == ("SO-EDIT-NEW", "新客戶", "2026-12-25")
+        assert tuple(line) == (second_model, 3)
+
+
+def test_order_cancel_releases_assigned_machines_and_hides_order(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine = production_inventory()[1][0]
+        mark_machine_painted(machine["id"], "2026-11-20", "admin")
+        order_id = create_sales_order("SO-CANCEL", "", "admin", [(model_id, 1)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+        assign_machine(machine["id"], line_id, "admin")
+    response = client.post(f"/orders/{order_id}/cancel", follow_redirects=True)
+    assert response.status_code == 200
+    assert "訂單已取消；已配機台已退回可用庫存" in response.get_data(as_text=True)
+    with app.app_context():
+        assert get_db().execute("SELECT is_active FROM sales_order WHERE id=?", (order_id,)).fetchone()[0] == 0
+        assert production_inventory()[0][0]["available_count"] == 1
+
+
+def test_order_delete_removes_order_history_and_releases_assigned_machines(client, app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine = production_inventory()[1][0]
+        mark_machine_painted(machine["id"], "2026-11-20", "admin")
+        order_id = create_sales_order("SO-DELETE", "", "admin", [(model_id, 1)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+        assign_machine(machine["id"], line_id, "admin")
+    response = client.post(f"/orders/{order_id}/delete", follow_redirects=True)
+    assert response.status_code == 200
+    assert "訂單已永久刪除；已配機台已退回可用庫存" in response.get_data(as_text=True)
+    with app.app_context():
+        assert get_db().execute("SELECT 1 FROM sales_order WHERE id=?", (order_id,)).fetchone() is None
+        assert get_db().execute("SELECT 1 FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone() is None
+        assert get_db().execute("SELECT COUNT(*) FROM machine_assignment WHERE order_line_id=?", (line_id,)).fetchone()[0] == 0
+        assert production_inventory()[0][0]["available_count"] == 1
+
+
+def test_paint_completion_creates_stock_then_assignment_can_be_cancelled(app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine_id = production_inventory()[1][0]["id"]
+        order_id = create_sales_order("SO-PAINT", "", "admin", [(model_id, 1)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+        mark_machine_painted(machine_id, "2026-11-19", "admin")
+        summary, machines = production_inventory()
+        assert summary[0]["pending_paint_count"] == 0
+        assert summary[0]["available_count"] == 1 and summary[0]["assigned_count"] == 0 and summary[0]["painted_count"] == 1
+        assert machines[0]["painted_at"] == "2026-11-19"
+        assignment_id = assign_machine(machine_id, line_id, "admin")
+        assert production_inventory()[0][0]["available_count"] == 0
+        unassign_machine(assignment_id, "admin", "cancelled")
+        assert production_inventory()[0][0]["available_count"] == 1
+
+
+def test_unpainted_machine_cannot_be_assigned(app):
+    with app.app_context():
+        model_id = create_model("HR-255", "HR255", serial_prefix="E")
+        batch_id, _ = create_batch(model_id, 2026, 1, 1, "operator")
+        ensure_barcodes(batch_id)
+        payloads = {row["barcode_type"]: row["payload"] for row in get_db().execute("SELECT barcode_type,payload FROM barcode_record WHERE batch_id=?", (batch_id,)).fetchall()}
+        scan(payloads["START"])
+        scan(payloads["FINISH"])
+        machine_id = production_inventory()[1][0]["id"]
+        order_id = create_sales_order("SO-BLOCKED", "", "admin", [(model_id, 1)])
+        line_id = get_db().execute("SELECT id FROM sales_order_line WHERE order_id=?", (order_id,)).fetchone()[0]
+        with pytest.raises(ValueError):
+            assign_machine(machine_id, line_id, "admin")
+
+
 def test_machine_master_is_not_part_of_new_product_flow(client, app):
     with app.app_context():
         model_id = create_model("HR-255", "HR255")
 
-    home = client.get("/")
+    home = client.get("/assembly")
     assert home.status_code == 200
     assert "機台主檔" not in home.get_data(as_text=True)
 
@@ -544,7 +846,7 @@ def test_v3_migration_preserves_legacy_job_and_foreign_keys(tmp_path):
         assert get_db().execute("PRAGMA foreign_key_check").fetchall() == []
         assert next(row["notnull"] for row in get_db().execute("PRAGMA table_info(job_run)") if row["name"] == "machine_id") == 0
         assert next(row["notnull"] for row in get_db().execute("PRAGMA table_info(job_run)") if row["name"] == "machine_no_snapshot") == 0
-        assert get_db().execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        assert get_db().execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 11
 
 
 def test_payload_round_trip_and_idempotent_scan(app):
@@ -604,14 +906,13 @@ def test_dashboard_status_cards_and_report_duration(client, app):
         assert format_duration("2026-10-16T08:00:00+00:00", "2026-10-17T09:05:06+00:00", "finished") == "1日 01:05:06"
         assert format_datetime("2026-10-19T03:15:20+00:00") == "2026-10-19 11:15:20"
 
-    home = client.get("/")
+    home = client.get("/assembly")
     assert home.status_code == 200
     assert b"href=\"/reports?status_group=incomplete\"" in home.data
     home_text = home.get_data(as_text=True)
     assert 'href="/scan"' in home_text and "報工掃描" in home_text
     assert "未完成" in home_text
     assert "已完成" in home_text
-
     with client.session_transaction() as session:
         session["admin_unlocked"] = True
     incomplete = client.get("/reports?status_group=incomplete")
@@ -624,6 +925,30 @@ def test_dashboard_status_cards_and_report_duration(client, app):
     started = client.get("/reports?status_group=incomplete")
     assert "進行中" in started.get_data(as_text=True)
 
+
+def test_root_is_system_switch(client):
+    page = client.get("/")
+    assert page.status_code == 200
+    assert 'href="/assembly"' in page.get_data(as_text=True)
+    assert 'href="/assignment"' in page.get_data(as_text=True)
+
+
+def test_brand_returns_to_the_current_system_home(client):
+    assignment_page = client.get("/orders").get_data(as_text=True)
+    assert 'class="brand" href="/assignment"' in assignment_page
+    assembly_page = client.get("/assembly").get_data(as_text=True)
+    assert 'class="brand" href="/assembly"' in assembly_page
+    assert 'href="/">回到首頁</a>' in assembly_page
+
+
+def test_assignment_home_has_three_work_entries(client):
+    page = client.get("/assignment")
+    assert page.status_code == 200
+    body = page.get_data(as_text=True)
+    assert 'href="/orders/new"' in body
+    assert 'href="/orders"' in body
+    assert 'href="/production-management"' in body
+    assert 'href="/completed-assignments"' not in body
 
 def test_report_status_group_filters_created_and_finished(client, app):
     model_id, _ = setup_data(app)

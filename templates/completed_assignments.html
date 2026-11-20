@@ -1,0 +1,6 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="hero"><div><p class="eyebrow">配單系統</p><h1>已完成配單</h1><p>此清單中的機台已對應需求單，實體機台應移至待校機區。</p></div></section>
+<section class="panel"><form method="get" class="filters"><label>機型 <select name="model_id"><option value="">全部機型</option>{% for model in models %}<option value="{{ model.id }}" {% if selected_model_id == model.id %}selected{% endif %}>{{ model.model_name }}</option>{% endfor %}</select></label><button class="button primary">套用篩選</button></form></section>
+<section class="panel"><h2>待校機清單</h2>{% if machines %}<div class="table-wrap"><table><thead><tr><th>機型</th><th>製號</th><th>需求單號</th><th>組裝完成日期</th><th>操作</th></tr></thead><tbody>{% for machine in machines %}<tr><td>{{ machine.model_name_snapshot }}</td><td>{{ machine.product_serial }}</td><td><strong>{{ machine.order_no }}</strong></td><td>{{ machine.completed_at[:10] }}</td><td><form method="post" action="{{ url_for('main.machine_unassign', assignment_id=machine.assignment_id) }}" class="inline" onsubmit="return confirm('確定取消此筆配單？機台會退回已噴漆可用庫存。');"><input type="hidden" name="model_id" value="{{ selected_model_id or '' }}"><input name="reason" placeholder="取消原因"><button class="button small">取消配單</button></form></td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">目前沒有已完成配單的機台。</p>{% endif %}</section>
+{% endblock %}

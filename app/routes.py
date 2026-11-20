@@ -2,14 +2,15 @@ import tempfile
 import hmac
 import secrets
 import sqlite3
-from datetime import datetime
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 
 from flask import Blueprint, current_app, flash, jsonify, redirect, render_template, request, send_file, session, url_for
 
 from .barcode import code128_svg
 from .db import get_db
-from .services import ASSEMBLY_STAGES, DEBUG_CLEAR_CHOICES, access_password_enabled, backup_database, change_access_password, clear_debug_data, correct_actual_qty, create_assembly_worker, create_batch, create_model, debug_clear_counts, delete_batch, delete_model, ensure_barcodes, export_xlsx, get_assembly_worker, get_batch, get_job, is_five_axis_model, list_assembly_workers, list_models, list_recent_batches, list_report_operators, parse_payload, query_report, restore_database, scan, set_access_password_enabled, set_assembly_worker_active, summarize_report_by_operator, update_model, verify_access_password
+from .services import ASSEMBLY_STAGES, DEBUG_CLEAR_CHOICES, access_password_enabled, add_sales_order_line, assign_machine, assign_machines, backup_database, cancel_sales_order, change_access_password, clear_debug_data, correct_actual_qty, create_assembly_worker, create_batch, create_model, create_sales_order, debug_clear_counts, delete_batch, delete_model, delete_sales_order_line, delete_sales_order, ensure_barcodes, export_xlsx, get_assembly_worker, get_batch, get_job, get_sales_order, is_five_axis_model, list_assembly_workers, list_available_inventory_machines, list_models, list_order_assignments, list_order_lines, list_recent_batches, list_report_operators, list_sales_orders, mark_machine_painted, mark_machine_painted_by_serial, parse_payload, production_inventory, query_report, reassign_machine, restore_database, scan, set_access_password_enabled, set_assembly_worker_active, summarize_report_by_operator, unassign_machine, update_model, update_sales_order, update_sales_order_line, verify_access_password
 
 bp = Blueprint("main", __name__)
 
@@ -23,6 +24,23 @@ PROTECTED_ENDPOINTS = {
     "main.batch_delete",
     "main.reports",
     "main.reports_export",
+    "main.production_management",
+    "main.orders",
+    "main.order_new",
+    "main.order_line_create",
+    "main.order_edit",
+    "main.order_update",
+    "main.order_line_update",
+    "main.order_line_delete",
+    "main.order_cancel",
+    "main.order_delete",
+    "main.order_assignment",
+    "main.order_line_assign",
+    "main.machine_assign",
+    "main.machine_unassign",
+    "main.machine_reassign",
+    "main.machine_paint_complete",
+    "main.machine_paint_complete_by_serial",
     "main.quantity_update",
     "main.settings",
     "main.change_password",
@@ -67,8 +85,12 @@ def render_home(scan_result=None):
 def index():
     if request.method == "GET":
         session.pop("admin_unlocked", None)
-    result = scan(request.form.get("payload", ""), "scanner") if request.method == "POST" else None
-    return render_home(result)
+    return render_template("system_home.html")
+
+
+@bp.get("/assembly")
+def assembly_home():
+    return render_home()
 
 
 @bp.route("/unlock", methods=["GET", "POST"])
@@ -248,6 +270,251 @@ def reports_export():
     export_xlsx(rows, tmp.name)
     filename = "INTJR_報工報表_" + datetime.now().strftime("%Y%m%d_%H%M") + ".xlsx"
     return send_file(tmp.name, as_attachment=True, download_name=filename)
+
+
+@bp.get("/production-management")
+def production_management():
+    model_id = request.args.get("model_id", type=int)
+    summary, machines = production_inventory()
+    stock_models = [row for row in summary if row["available_count"]]
+    if model_id:
+        summary = [row for row in summary if row["model_id"] == model_id]
+        machines = [machine for machine in machines if machine["model_id"] == model_id]
+    return render_template(
+        "production_management.html",
+        available_machines=[machine for machine in machines if model_id and machine["painted_at"] and not machine["assignment_id"]],
+        inventory_summary=[row for row in summary if model_id and row["available_count"]],
+        stock_models=stock_models,
+        selected_model_id=model_id,
+        today=date.today().isoformat(),
+    )
+
+
+@bp.get("/assignment")
+def assignment_home():
+    return render_template("assignment_home.html")
+
+
+@bp.get("/completed-assignments")
+def completed_assignments():
+    return redirect(url_for("main.orders", view="completed"))
+
+
+def create_order_from_request(destination):
+    try:
+        model_ids = request.form.getlist("model_id")
+        quantities = request.form.getlist("required_qty")
+        lines = [(model_id, quantity) for model_id, quantity in zip(model_ids, quantities) if model_id or quantity]
+        create_sales_order(
+            request.form.get("order_no"),
+            "",
+            request.form.get("operator_name", "admin"),
+            lines,
+            customer_name=request.form.get("customer_name"),
+            expected_ship_date=request.form.get("expected_ship_date"),
+        )
+        flash("需求單與機型需求已輸入", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for(destination))
+
+
+@bp.get("/orders")
+def orders():
+    view = request.args.get("view", "pending")
+    if view not in {"pending", "completed", "history"}:
+        view = "pending"
+    query = (request.args.get("q") or "").strip().lower()
+    source_orders = list_sales_orders(active_only=view != "history")
+    if view == "pending":
+        orders = [order for order in source_orders if order["assigned_qty"] < order["required_qty"]]
+    elif view == "completed":
+        orders = [order for order in source_orders if order["required_qty"] and order["assigned_qty"] >= order["required_qty"]]
+    else:
+        orders = [order for order in source_orders if not order["is_active"]]
+    if query:
+        orders = [order for order in orders if query in order["order_no"].lower() or query in (order["customer_name"] or "").lower()]
+    pending_lines_by_order = defaultdict(list)
+    for line in list_order_lines(unassigned_only=True):
+        pending_lines_by_order[line["order_id"]].append(line)
+    return render_template(
+        "orders.html",
+        orders=orders,
+        selected_view=view,
+        order_query=query,
+        pending_lines_by_order=pending_lines_by_order,
+    )
+
+
+@bp.route("/orders/new", methods=["GET", "POST"])
+def order_new():
+    if request.method == "POST":
+        return create_order_from_request("main.order_new")
+    return render_template("order_new.html", models=list_models(True))
+
+
+@bp.post("/orders")
+def order_create_legacy():
+    return create_order_from_request("main.orders")
+
+
+@bp.post("/orders/<int:order_id>/lines")
+def order_line_create(order_id):
+    try:
+        add_sales_order_line(order_id, int(request.form["model_id"]), request.form.get("required_qty"), request.form.get("operator_name", "admin"))
+        flash("需求單明細已新增", "success")
+    except (ValueError, KeyError) as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.orders"))
+
+
+@bp.get("/orders/<int:order_id>/edit")
+def order_edit(order_id):
+    order = get_sales_order(order_id)
+    if not order or not order["is_active"]:
+        return "找不到有效訂單", 404
+    assignments_by_line = defaultdict(list)
+    for assignment in list_order_assignments(order_id):
+        assignments_by_line[assignment["order_line_id"]].append(assignment)
+    return render_template(
+        "order_edit.html",
+        order=order,
+        lines=list_order_lines(order_id=order_id),
+        models=list_models(True),
+        assignments_by_line=assignments_by_line,
+    )
+
+
+@bp.post("/orders/<int:order_id>/update")
+def order_update(order_id):
+    try:
+        update_sales_order(order_id, request.form.get("order_no"), request.form.get("customer_name"), request.form.get("expected_ship_date"), request.form.get("operator_name", "admin"))
+        flash("訂單基本資料已更新", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.order_edit", order_id=order_id))
+
+
+@bp.post("/orders/<int:order_id>/lines/<int:line_id>/update")
+def order_line_update(order_id, line_id):
+    try:
+        update_sales_order_line(order_id, line_id, request.form.get("model_id"), request.form.get("required_qty"), request.form.get("operator_name", "admin"))
+        flash("訂單機型需求已更新", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.order_edit", order_id=order_id))
+
+
+@bp.post("/orders/<int:order_id>/lines/<int:line_id>/delete")
+def order_line_delete(order_id, line_id):
+    try:
+        delete_sales_order_line(order_id, line_id, request.form.get("operator_name", "admin"))
+        flash("訂單機型需求已移除", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.order_edit", order_id=order_id))
+
+
+@bp.post("/orders/<int:order_id>/cancel")
+def order_cancel(order_id):
+    try:
+        cancel_sales_order(order_id, request.form.get("operator_name", "admin"))
+        flash("訂單已取消；已配機台已退回可用庫存", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("main.order_edit", order_id=order_id))
+    return redirect(url_for("main.orders"))
+
+
+@bp.post("/orders/<int:order_id>/delete")
+def order_delete(order_id):
+    try:
+        delete_sales_order(order_id, request.form.get("operator_name", "admin"))
+        flash("訂單已永久刪除；已配機台已退回可用庫存", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("main.order_edit", order_id=order_id))
+    return redirect(url_for("main.orders"))
+
+
+@bp.get("/orders/<int:order_id>/assignment")
+def order_assignment(order_id):
+    order = get_sales_order(order_id)
+    if not order:
+        return "找不到需求單", 404
+    lines = list_order_lines(order_id=order_id)
+    available_by_model = {line["model_id"]: list_available_inventory_machines(line["model_id"]) for line in lines}
+    return render_template("order_assignment.html", order=order, lines=lines, available_by_model=available_by_model)
+
+
+@bp.post("/orders/<int:order_id>/lines/<int:line_id>/assign")
+def order_line_assign(order_id, line_id):
+    try:
+        line = next((item for item in list_order_lines(order_id=order_id) if item["id"] == line_id), None)
+        if not line:
+            raise ValueError("找不到此需求單的機型需求")
+        count = assign_machines(request.form.getlist("machine_id"), line_id, request.form.get("operator_name", "admin"))
+        flash(f"已將 {count} 台 {line['model_name']} 機台配給需求單 {line['order_no']}", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.order_assignment", order_id=order_id))
+
+
+@bp.post("/production-management/machines/<int:machine_id>/assign")
+def machine_assign(machine_id):
+    try:
+        assign_machine(machine_id, int(request.form["order_line_id"]), request.form.get("operator_name", "admin"))
+        flash("製號已配給需求單", "success")
+    except (ValueError, KeyError) as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.production_management", model_id=request.form.get("model_id") or None))
+
+
+@bp.post("/production-management/assignments/<int:assignment_id>/unassign")
+def machine_unassign(assignment_id):
+    try:
+        unassign_machine(assignment_id, request.form.get("operator_name", "admin"), request.form.get("reason"))
+        flash("配單已取消，製號已退回已噴漆可用庫存", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    order_id = request.form.get("order_id", type=int)
+    if order_id:
+        return redirect(url_for("main.order_edit", order_id=order_id))
+    return redirect(url_for("main.orders", view="completed"))
+
+
+@bp.post("/production-management/assignments/<int:assignment_id>/reassign")
+def machine_reassign(assignment_id):
+    try:
+        reassign_machine(assignment_id, int(request.form["order_line_id"]), request.form.get("operator_name", "admin"), request.form.get("reason", "改配"))
+        flash("製號已改配；原需求單明細已自動回復", "success")
+    except (ValueError, KeyError) as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.production_management", model_id=request.form.get("model_id") or None))
+
+
+@bp.post("/production-management/machines/<int:machine_id>/paint-complete")
+def machine_paint_complete(machine_id):
+    try:
+        mark_machine_painted(machine_id, request.form.get("painted_at"), request.form.get("operator_name", "admin"))
+        flash("已登記噴漆完成，機台已入庫並列入可配單庫存", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.production_management", model_id=request.form.get("model_id") or None))
+
+
+@bp.post("/production-management/paint-complete")
+def machine_paint_complete_by_serial():
+    try:
+        machine = mark_machine_painted_by_serial(
+            request.form.get("product_serial"),
+            request.form.get("painted_at"),
+            request.form.get("operator_name", "admin"),
+        )
+        flash(f"{machine['product_serial']}（{machine['model_name_snapshot']}）已登記噴漆完成並入庫", "success")
+    except ValueError as exc:
+        flash(str(exc), "error")
+    return redirect(url_for("main.production_management", model_id=request.form.get("model_id") or None))
 
 
 @bp.post("/jobs/<job_run_id>/quantity")

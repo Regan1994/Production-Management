@@ -126,12 +126,63 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at TEXT NOT NULL
 );
 
+-- A physical completed product.  job_run remains the source for assembly time;
+-- this table is the stable hand-off point for production management.
+CREATE TABLE IF NOT EXISTS production_machine (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_serial TEXT NOT NULL UNIQUE,
+    model_id INTEGER NOT NULL REFERENCES model_master(id),
+    model_name_snapshot TEXT NOT NULL,
+    model_code_snapshot TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    painted_at TEXT,
+    source_job_run_id TEXT REFERENCES job_run(job_run_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sales_order (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    notes TEXT,
+    customer_name TEXT,
+    expected_ship_date TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sales_order_line (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES sales_order(id),
+    model_id INTEGER NOT NULL REFERENCES model_master(id),
+    required_qty INTEGER NOT NULL CHECK(required_qty > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(order_id, model_id)
+);
+
+-- Keeping ended rows is the automatic re-assignment history.
+CREATE TABLE IF NOT EXISTS machine_assignment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id INTEGER NOT NULL REFERENCES production_machine(id),
+    order_line_id INTEGER NOT NULL REFERENCES sales_order_line(id),
+    assigned_at TEXT NOT NULL,
+    unassigned_at TEXT,
+    unassigned_reason TEXT,
+    assigned_by TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_job_run_status ON job_run(status);
 CREATE INDEX IF NOT EXISTS idx_job_run_created_at ON job_run(created_at);
 CREATE INDEX IF NOT EXISTS idx_job_run_model ON job_run(model_code_snapshot);
 CREATE INDEX IF NOT EXISTS idx_job_run_machine ON job_run(machine_no_snapshot);
 CREATE INDEX IF NOT EXISTS idx_scan_event_time ON scan_event(scanned_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_production_machine_model ON production_machine(model_id);
+CREATE INDEX IF NOT EXISTS idx_sales_order_line_order ON sales_order_line(order_id);
+CREATE INDEX IF NOT EXISTS idx_machine_assignment_line ON machine_assignment(order_line_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_machine_assignment ON machine_assignment(machine_id) WHERE unassigned_at IS NULL;
 """
 
 
@@ -186,6 +237,13 @@ def init_db():
     db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (6, utc_now()))
     migrate_job_assembly_stage(db)
     db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (7, utc_now()))
+    migrate_production_management(db)
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (8, utc_now()))
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (9, utc_now()))
+    migrate_paint_completion(db)
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (10, utc_now()))
+    migrate_sales_order_details(db)
+    db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)", (11, utc_now()))
     if needs_batch_mode_migration:
         db.execute("UPDATE app_settings SET value='batch', updated_at=? WHERE key='batch_scan_mode'", (utc_now(),))
     db.execute(
@@ -205,6 +263,63 @@ def init_db():
         ("access_password_enabled", "1", utc_now()),
     )
     db.commit()
+
+
+def migrate_production_management(db):
+    """Backfill the production-management hand-off from already finished jobs.
+
+    A normal model needs its one finished job.  A five-axis product is handed
+    over only after all four independently recorded stages are finished.
+    """
+    now = utc_now()
+    db.execute(
+        """
+        INSERT OR IGNORE INTO production_machine(
+            product_serial,model_id,model_name_snapshot,model_code_snapshot,
+            completed_at,source_job_run_id,created_at,updated_at
+        )
+        SELECT j.product_serial,j.model_id,j.model_name_snapshot,j.model_code_snapshot,
+               j.finished_at,j.job_run_id,?,?
+        FROM job_run j
+        WHERE j.product_serial IS NOT NULL
+          AND j.assembly_stage IS NULL
+          AND j.status='finished'
+        """,
+        (now, now),
+    )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO production_machine(
+            product_serial,model_id,model_name_snapshot,model_code_snapshot,
+            completed_at,source_job_run_id,created_at,updated_at
+        )
+        SELECT j.product_serial,j.model_id,j.model_name_snapshot,j.model_code_snapshot,
+               MAX(j.finished_at),
+               MAX(CASE WHEN j.assembly_stage='組' THEN j.job_run_id END), ?,?
+        FROM job_run j
+        WHERE j.product_serial IS NOT NULL
+          AND j.assembly_stage IN ('旋','傾','尾','組')
+        GROUP BY j.product_serial,j.model_id,j.model_name_snapshot,j.model_code_snapshot
+        HAVING COUNT(DISTINCT CASE WHEN j.status='finished' THEN j.assembly_stage END)=4
+        """,
+        (now, now),
+    )
+
+
+def migrate_paint_completion(db):
+    """Add the production-management hand-off date without rewriting history."""
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(production_machine)")}
+    if "painted_at" not in columns:
+        db.execute("ALTER TABLE production_machine ADD COLUMN painted_at TEXT")
+
+
+def migrate_sales_order_details(db):
+    """Add the order-header fields used by the production office."""
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(sales_order)")}
+    if "customer_name" not in columns:
+        db.execute("ALTER TABLE sales_order ADD COLUMN customer_name TEXT")
+    if "expected_ship_date" not in columns:
+        db.execute("ALTER TABLE sales_order ADD COLUMN expected_ship_date TEXT")
 
 
 def migrate_product_serials(db):

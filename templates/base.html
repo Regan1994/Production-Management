@@ -3,16 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>INTJR 條碼報工系統</title>
+  <title>TJR組立配單系統</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body>
+  {% set assignment_endpoints = ['main.assignment_home', 'main.production_management', 'main.completed_assignments', 'main.orders', 'main.order_new', 'main.order_line_create', 'main.order_edit', 'main.order_update', 'main.order_line_update', 'main.order_line_delete', 'main.order_cancel', 'main.order_delete', 'main.order_assignment', 'main.order_line_assign', 'main.machine_assign', 'main.machine_unassign', 'main.machine_reassign', 'main.machine_paint_complete', 'main.machine_paint_complete_by_serial'] %}
   <header class="topbar">
-    <a class="brand" href="{{ url_for('main.index') }}">INTJR 條碼報工</a>
+    {% if request.endpoint in assignment_endpoints %}<a class="brand" href="{{ url_for('main.assignment_home') }}">TJR組立配單系統</a>
+    {% elif request.endpoint == 'main.index' %}<a class="brand" href="{{ url_for('main.index') }}">TJR組立配單系統</a>
+    {% else %}<a class="brand" href="{{ url_for('main.assembly_home') }}">TJR組立配單系統</a>{% endif %}
     <nav class="admin-nav">
+      <a href="{{ url_for('main.index') }}">回到首頁</a>
+      <a href="{{ url_for('main.assembly_home') }}">組裝系統</a>
+      <a href="{{ url_for('main.assignment_home') }}">配單系統</a>
       <a href="{{ url_for('main.settings') }}">設定</a>
-      <a href="{{ url_for('main.debug_clear') }}">清除資料</a>
     </nav>
   </header>
   <main class="container">
@@ -24,4 +29,3 @@
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
-

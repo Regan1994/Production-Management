@@ -4,12 +4,12 @@ import re
 import shutil
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from .db import get_db, utc_now
+from .db import get_db, migrate_production_management, utc_now
 
 
 ALLOWED_SEMANTICS = {"unknown", "asset", "serial"}
@@ -492,6 +492,484 @@ def get_job(job_run_id):
     return get_db().execute("SELECT * FROM job_run WHERE job_run_id=?", (job_run_id,)).fetchone()
 
 
+def sync_production_management():
+    """Materialise finished physical machines for the production-management flow."""
+    migrate_production_management(get_db())
+
+
+def production_inventory(model_id=None):
+    """Return production machines by their paint, stock, and assignment state.
+
+    A completed machine waits for paint. Only a painted, unassigned machine
+    is usable stock and can be assigned to a requirement sheet.
+    """
+    db = get_db()
+    sync_production_management()
+    params = []
+    where = ""
+    if model_id:
+        where = "WHERE pm.model_id=?"
+        params.append(model_id)
+    summary = db.execute(
+        f"""
+        SELECT pm.model_id, pm.model_name_snapshot, pm.model_code_snapshot,
+               COUNT(*) AS completed_count,
+               SUM(CASE WHEN pm.painted_at IS NULL THEN 1 ELSE 0 END) AS pending_paint_count,
+               SUM(CASE WHEN pm.painted_at IS NOT NULL AND active_assignment.id IS NULL THEN 1 ELSE 0 END) AS available_count,
+               SUM(CASE WHEN pm.painted_at IS NOT NULL AND active_assignment.id IS NOT NULL THEN 1 ELSE 0 END) AS assigned_count,
+               SUM(CASE WHEN pm.painted_at IS NOT NULL THEN 1 ELSE 0 END) AS painted_count
+        FROM production_machine pm
+        LEFT JOIN machine_assignment active_assignment
+          ON active_assignment.machine_id=pm.id AND active_assignment.unassigned_at IS NULL
+        {where}
+        GROUP BY pm.model_id, pm.model_name_snapshot, pm.model_code_snapshot
+        ORDER BY pm.model_name_snapshot
+        """,
+        params,
+    ).fetchall()
+    machines = db.execute(
+        f"""
+        SELECT pm.*, j.assembly_stage, active_assignment.id AS assignment_id,
+               so.order_no, sol.required_qty,
+               (SELECT COUNT(*) FROM machine_assignment assigned
+                WHERE assigned.order_line_id=sol.id AND assigned.unassigned_at IS NULL) AS assigned_qty
+        FROM production_machine pm
+        LEFT JOIN job_run j ON j.job_run_id=pm.source_job_run_id
+        LEFT JOIN machine_assignment active_assignment
+          ON active_assignment.machine_id=pm.id AND active_assignment.unassigned_at IS NULL
+        LEFT JOIN sales_order_line sol ON sol.id=active_assignment.order_line_id
+        LEFT JOIN sales_order so ON so.id=sol.order_id
+        {where}
+        ORDER BY pm.model_name_snapshot, pm.product_serial
+        """,
+        params,
+    ).fetchall()
+    return summary, machines
+
+
+def list_order_lines(active_only=True, model_id=None, order_id=None, unassigned_only=False):
+    clauses, params = [], []
+    if active_only:
+        clauses.append("so.is_active=1")
+    if model_id:
+        clauses.append("sol.model_id=?")
+        params.append(model_id)
+    if order_id:
+        clauses.append("sol.order_id=?")
+        params.append(order_id)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    having = "HAVING COUNT(ma.id) < sol.required_qty" if unassigned_only else ""
+    return get_db().execute(
+        f"""
+        SELECT sol.*, so.order_no, so.notes, mm.model_name,
+               COUNT(ma.id) AS assigned_qty,
+               MAX(sol.required_qty-COUNT(ma.id), 0) AS unassigned_qty
+        FROM sales_order_line sol
+        JOIN sales_order so ON so.id=sol.order_id
+        JOIN model_master mm ON mm.id=sol.model_id
+        LEFT JOIN machine_assignment ma ON ma.order_line_id=sol.id AND ma.unassigned_at IS NULL
+        {where}
+        GROUP BY sol.id, so.order_no, so.notes, mm.model_name
+        {having}
+        ORDER BY so.order_no, mm.model_name
+        """,
+        params,
+    ).fetchall()
+
+
+def list_sales_orders(active_only=True):
+    where = "WHERE so.is_active=1" if active_only else ""
+    return get_db().execute(
+        f"""
+        SELECT so.*, COUNT(sol.id) AS line_count,
+               COALESCE(SUM(sol.required_qty), 0) AS required_qty,
+               COALESCE(SUM((SELECT COUNT(*) FROM machine_assignment ma
+                             WHERE ma.order_line_id=sol.id AND ma.unassigned_at IS NULL)), 0) AS assigned_qty
+        FROM sales_order so LEFT JOIN sales_order_line sol ON sol.order_id=so.id
+        {where}
+        GROUP BY so.id ORDER BY so.is_active DESC, so.order_no
+        """
+    ).fetchall()
+
+
+def list_order_assignments(order_id):
+    return get_db().execute(
+        """
+        SELECT ma.id AS assignment_id, ma.order_line_id, pm.product_serial, pm.painted_at,
+               mm.model_name
+        FROM machine_assignment ma
+        JOIN sales_order_line sol ON sol.id=ma.order_line_id
+        JOIN model_master mm ON mm.id=sol.model_id
+        JOIN production_machine pm ON pm.id=ma.machine_id
+        WHERE sol.order_id=? AND ma.unassigned_at IS NULL
+        ORDER BY sol.id, pm.product_serial
+        """,
+        (order_id,),
+    ).fetchall()
+
+
+def get_sales_order(order_id):
+    return get_db().execute("SELECT * FROM sales_order WHERE id=?", (order_id,)).fetchone()
+
+
+def list_available_inventory_machines(model_id):
+    sync_production_management()
+    return get_db().execute(
+        """
+        SELECT pm.*
+        FROM production_machine pm
+        LEFT JOIN machine_assignment active_assignment
+          ON active_assignment.machine_id=pm.id AND active_assignment.unassigned_at IS NULL
+        WHERE pm.model_id=? AND pm.painted_at IS NOT NULL AND active_assignment.id IS NULL
+        ORDER BY pm.painted_at, pm.product_serial
+        """,
+        (model_id,),
+    ).fetchall()
+
+
+def create_sales_order(order_no, notes, operator_name, lines=None, customer_name="", expected_ship_date=""):
+    order_no = validate_text(order_no, "單號")
+    customer_name = validate_text(customer_name, "客戶名稱", required=False) or None
+    if expected_ship_date:
+        try:
+            expected_ship_date = date.fromisoformat(expected_ship_date).isoformat()
+        except ValueError as exc:
+            raise ValueError("預計出貨日格式不正確") from exc
+    else:
+        expected_ship_date = None
+    now = utc_now()
+    db = get_db()
+    lines = lines or []
+    try:
+        cursor = db.execute(
+            "INSERT INTO sales_order(order_no,notes,customer_name,expected_ship_date,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (order_no, (notes or "").strip() or None, customer_name, expected_ship_date, now, now),
+        )
+        order_id = cursor.lastrowid
+        used_models = set()
+        for model_id, required_qty in lines:
+            try:
+                model_id, required_qty = int(model_id), int(required_qty)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("每個訂單機型都必須填寫正整數台數") from exc
+            if required_qty < 1:
+                raise ValueError("每個訂單機型都必須填寫正整數台數")
+            if model_id in used_models:
+                raise ValueError("同一張訂單不可重複填寫相同機型")
+            if not db.execute("SELECT 1 FROM model_master WHERE id=?", (model_id,)).fetchone():
+                raise ValueError("找不到機型")
+            used_models.add(model_id)
+            db.execute("INSERT INTO sales_order_line(order_id,model_id,required_qty,created_at,updated_at) VALUES(?,?,?,?,?)", (order_id, model_id, required_qty, now, now))
+    except sqlite3.IntegrityError as exc:
+        db.rollback()
+        raise ValueError("單號已存在") from exc
+    except Exception:
+        db.rollback()
+        raise
+    add_audit("create", "sales_order", str(order_id), {"order_no": order_no, "customer_name": customer_name, "expected_ship_date": expected_ship_date, "line_count": len(lines)}, operator_name)
+    db.commit()
+    return order_id
+
+
+def update_sales_order(order_id, order_no, customer_name, expected_ship_date, operator_name):
+    order_no = validate_text(order_no, "訂單號碼")
+    customer_name = validate_text(customer_name, "客戶名稱", required=False) or None
+    if expected_ship_date:
+        try:
+            expected_ship_date = date.fromisoformat(expected_ship_date).isoformat()
+        except ValueError as exc:
+            raise ValueError("預計出貨日格式不正確") from exc
+    else:
+        expected_ship_date = None
+    db = get_db()
+    if not db.execute("SELECT 1 FROM sales_order WHERE id=? AND is_active=1", (order_id,)).fetchone():
+        raise ValueError("找不到有效訂單")
+    try:
+        db.execute(
+            "UPDATE sales_order SET order_no=?,customer_name=?,expected_ship_date=?,updated_at=? WHERE id=?",
+            (order_no, customer_name, expected_ship_date, utc_now(), order_id),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("訂單號碼已存在") from exc
+    add_audit("update", "sales_order", str(order_id), {"order_no": order_no, "customer_name": customer_name, "expected_ship_date": expected_ship_date}, operator_name)
+    db.commit()
+
+
+def update_sales_order_line(order_id, line_id, model_id, required_qty, operator_name):
+    try:
+        model_id, required_qty = int(model_id), int(required_qty)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("機型與需求台數必須正確填寫") from exc
+    if required_qty < 1:
+        raise ValueError("訂單需求台數必須是正整數")
+    db = get_db()
+    line = db.execute(
+        "SELECT sol.* FROM sales_order_line sol JOIN sales_order so ON so.id=sol.order_id WHERE sol.id=? AND sol.order_id=? AND so.is_active=1",
+        (line_id, order_id),
+    ).fetchone()
+    if not line:
+        raise ValueError("找不到有效訂單機型需求")
+    if not db.execute("SELECT 1 FROM model_master WHERE id=?", (model_id,)).fetchone():
+        raise ValueError("找不到機型")
+    assigned_qty = db.execute("SELECT COUNT(*) FROM machine_assignment WHERE order_line_id=? AND unassigned_at IS NULL", (line_id,)).fetchone()[0]
+    if required_qty < assigned_qty:
+        raise ValueError(f"此機型已有 {assigned_qty} 台完成配單，需求台數不可低於已配台數")
+    if model_id != line["model_id"] and assigned_qty:
+        raise ValueError("此機型已有配單；請先取消配單後，才可變更需求機型")
+    if db.execute("SELECT 1 FROM sales_order_line WHERE order_id=? AND model_id=? AND id<>?", (order_id, model_id, line_id)).fetchone():
+        raise ValueError("同一張訂單不可重複填寫相同機型")
+    db.execute("UPDATE sales_order_line SET model_id=?,required_qty=?,updated_at=? WHERE id=?", (model_id, required_qty, utc_now(), line_id))
+    add_audit("update", "sales_order_line", str(line_id), {"order_id": order_id, "model_id": model_id, "required_qty": required_qty}, operator_name)
+    db.commit()
+
+
+def delete_sales_order_line(order_id, line_id, operator_name):
+    db = get_db()
+    line = db.execute(
+        "SELECT sol.* FROM sales_order_line sol JOIN sales_order so ON so.id=sol.order_id WHERE sol.id=? AND sol.order_id=? AND so.is_active=1",
+        (line_id, order_id),
+    ).fetchone()
+    if not line:
+        raise ValueError("找不到有效訂單機型需求")
+    if db.execute("SELECT 1 FROM machine_assignment WHERE order_line_id=? AND unassigned_at IS NULL", (line_id,)).fetchone():
+        raise ValueError("此機型已有配單；請先取消配單後才可移除")
+    db.execute("DELETE FROM sales_order_line WHERE id=?", (line_id,))
+    add_audit("delete", "sales_order_line", str(line_id), {"order_id": order_id}, operator_name)
+    db.commit()
+
+
+def cancel_sales_order(order_id, operator_name):
+    db = get_db()
+    order = db.execute("SELECT * FROM sales_order WHERE id=? AND is_active=1", (order_id,)).fetchone()
+    if not order:
+        raise ValueError("找不到有效訂單")
+    now = utc_now()
+    assignments = db.execute(
+        "SELECT ma.id,ma.machine_id FROM machine_assignment ma JOIN sales_order_line sol ON sol.id=ma.order_line_id WHERE sol.order_id=? AND ma.unassigned_at IS NULL",
+        (order_id,),
+    ).fetchall()
+    try:
+        for assignment in assignments:
+            db.execute("UPDATE machine_assignment SET unassigned_at=?,unassigned_reason=? WHERE id=?", (now, "訂單取消", assignment["id"]))
+            add_audit("unassign", "production_machine", str(assignment["machine_id"]), {"assignment_id": assignment["id"], "reason": "訂單取消"}, operator_name)
+        db.execute("UPDATE sales_order SET is_active=0,updated_at=? WHERE id=?", (now, order_id))
+        add_audit("cancel", "sales_order", str(order_id), {"order_no": order["order_no"], "released_machine_count": len(assignments)}, operator_name)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def delete_sales_order(order_id, operator_name):
+    """Permanently remove an order and every assignment record linked to it."""
+    db = get_db()
+    order = db.execute("SELECT * FROM sales_order WHERE id=? AND is_active=1", (order_id,)).fetchone()
+    if not order:
+        raise ValueError("找不到有效訂單")
+    active_machine_count = db.execute(
+        """
+        SELECT COUNT(*)
+        FROM machine_assignment ma
+        JOIN sales_order_line sol ON sol.id=ma.order_line_id
+        WHERE sol.order_id=? AND ma.unassigned_at IS NULL
+        """,
+        (order_id,),
+    ).fetchone()[0]
+    try:
+        # Delete rather than end assignment rows so the removed order has no business history.
+        db.execute(
+            "DELETE FROM machine_assignment WHERE order_line_id IN (SELECT id FROM sales_order_line WHERE order_id=?)",
+            (order_id,),
+        )
+        db.execute("DELETE FROM sales_order_line WHERE order_id=?", (order_id,))
+        db.execute("DELETE FROM sales_order WHERE id=?", (order_id,))
+        add_audit("delete", "sales_order", str(order_id), {"order_no": order["order_no"], "released_machine_count": active_machine_count}, operator_name)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
+def add_sales_order_line(order_id, model_id, required_qty, operator_name):
+    try:
+        required_qty = int(required_qty)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("訂單需求台數必須是正整數") from exc
+    if required_qty < 1:
+        raise ValueError("訂單需求台數必須是正整數")
+    db = get_db()
+    if not db.execute("SELECT 1 FROM sales_order WHERE id=? AND is_active=1", (order_id,)).fetchone():
+        raise ValueError("找不到有效訂單")
+    if not db.execute("SELECT 1 FROM model_master WHERE id=?", (model_id,)).fetchone():
+        raise ValueError("找不到機型")
+    now = utc_now()
+    try:
+        cursor = db.execute("INSERT INTO sales_order_line(order_id,model_id,required_qty,created_at,updated_at) VALUES(?,?,?,?,?)", (order_id, model_id, required_qty, now, now))
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("同一張訂單的同一機型只能有一筆需求；請改用調整需求功能") from exc
+    add_audit("create", "sales_order_line", str(cursor.lastrowid), {"order_id": order_id, "model_id": model_id, "required_qty": required_qty}, operator_name)
+    db.commit()
+
+
+def assign_machine(machine_id, order_line_id, operator_name):
+    db = get_db()
+    machine = db.execute("SELECT * FROM production_machine WHERE id=?", (machine_id,)).fetchone()
+    line = db.execute("SELECT sol.*,so.order_no FROM sales_order_line sol JOIN sales_order so ON so.id=sol.order_id WHERE sol.id=? AND so.is_active=1", (order_line_id,)).fetchone()
+    if not machine or not line:
+        raise ValueError("找不到可配單的機台或有效訂單明細")
+    if machine["model_id"] != line["model_id"]:
+        raise ValueError("製號機型與訂單需求機型不一致")
+    if not machine["painted_at"]:
+        raise ValueError("\u8acb\u5148\u767b\u8a18\u5674\u6f06\u5b8c\u6210\u5165\u5eab\uff0c\u624d\u53ef\u914d\u55ae")
+    if db.execute("SELECT 1 FROM machine_assignment WHERE machine_id=? AND unassigned_at IS NULL", (machine_id,)).fetchone():
+        raise ValueError("此製號已有有效配單，請先解除或改配")
+    assigned_qty = db.execute(
+        "SELECT COUNT(*) FROM machine_assignment WHERE order_line_id=? AND unassigned_at IS NULL",
+        (order_line_id,),
+    ).fetchone()[0]
+    if assigned_qty >= line["required_qty"]:
+        raise ValueError("\u6b64\u9700\u6c42\u55ae\u660e\u7d30\u5df2\u5b8c\u6210\u914d\u55ae\uff0c\u4e0d\u53ef\u8d85\u984d\u914d\u7f6e")
+    now = utc_now()
+    cursor = db.execute("INSERT INTO machine_assignment(machine_id,order_line_id,assigned_at,assigned_by) VALUES(?,?,?,?)", (machine_id, order_line_id, now, operator_name or "admin"))
+    add_audit("assign", "production_machine", str(machine_id), {"order_line_id": order_line_id, "order_no": line["order_no"]}, operator_name)
+    db.commit()
+    return cursor.lastrowid
+
+
+def assign_machines(machine_ids, order_line_id, operator_name):
+    """Assign a selected set of available machines to one order line atomically."""
+    try:
+        machine_ids = [int(machine_id) for machine_id in machine_ids]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("請選擇有效的庫存機台") from exc
+    if not machine_ids:
+        raise ValueError("請至少選擇一台機台")
+    if len(set(machine_ids)) != len(machine_ids):
+        raise ValueError("機台不可重複選擇")
+
+    db = get_db()
+    line = db.execute(
+        "SELECT sol.*,so.order_no FROM sales_order_line sol JOIN sales_order so ON so.id=sol.order_id WHERE sol.id=? AND so.is_active=1",
+        (order_line_id,),
+    ).fetchone()
+    if not line:
+        raise ValueError("找不到有效訂單明細")
+    assigned_qty = db.execute(
+        "SELECT COUNT(*) FROM machine_assignment WHERE order_line_id=? AND unassigned_at IS NULL",
+        (order_line_id,),
+    ).fetchone()[0]
+    if assigned_qty + len(machine_ids) > line["required_qty"]:
+        raise ValueError(f"此需求單明細尚缺 {line['required_qty'] - assigned_qty} 台，不能超額配單")
+
+    placeholders = ",".join("?" for _ in machine_ids)
+    machines = db.execute(
+        f"""
+        SELECT pm.*, active_assignment.id AS assignment_id
+        FROM production_machine pm
+        LEFT JOIN machine_assignment active_assignment
+          ON active_assignment.machine_id=pm.id AND active_assignment.unassigned_at IS NULL
+        WHERE pm.id IN ({placeholders})
+        """,
+        machine_ids,
+    ).fetchall()
+    if len(machines) != len(machine_ids):
+        raise ValueError("部分機台不存在")
+    for machine in machines:
+        if machine["model_id"] != line["model_id"]:
+            raise ValueError("選取的機台與訂單需求機型不一致")
+        if not machine["painted_at"]:
+            raise ValueError("選取的機台尚未登記噴漆完成入庫")
+        if machine["assignment_id"]:
+            raise ValueError("選取的機台已有有效配單，請重新整理後再試")
+
+    now = utc_now()
+    try:
+        for machine_id in machine_ids:
+            cursor = db.execute(
+                "INSERT INTO machine_assignment(machine_id,order_line_id,assigned_at,assigned_by) VALUES(?,?,?,?)",
+                (machine_id, order_line_id, now, operator_name or "admin"),
+            )
+            add_audit(
+                "assign",
+                "production_machine",
+                str(machine_id),
+                {"order_line_id": order_line_id, "order_no": line["order_no"]},
+                operator_name,
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return len(machine_ids)
+
+
+def unassign_machine(assignment_id, operator_name, reason=""):
+    db = get_db()
+    assignment = db.execute("SELECT * FROM machine_assignment WHERE id=? AND unassigned_at IS NULL", (assignment_id,)).fetchone()
+    if not assignment:
+        raise ValueError("找不到有效配單")
+    now = utc_now()
+    db.execute("UPDATE machine_assignment SET unassigned_at=?,unassigned_reason=? WHERE id=?", (now, (reason or "").strip() or None, assignment_id))
+    add_audit("unassign", "production_machine", str(assignment["machine_id"]), {"assignment_id": assignment_id, "reason": (reason or "").strip() or None}, operator_name)
+    db.commit()
+
+
+def mark_machine_painted(machine_id, painted_at, operator_name):
+    try:
+        painted_at = date.fromisoformat((painted_at or "").strip()).isoformat()
+    except ValueError as exc:
+        raise ValueError("噴漆完成日格式不正確") from exc
+    db = get_db()
+    machine = db.execute("SELECT * FROM production_machine WHERE id=?", (machine_id,)).fetchone()
+    if not machine:
+        raise ValueError("找不到機台")
+    if machine["painted_at"]:
+        raise ValueError("此機台已登記噴漆完成")
+    db.execute("UPDATE production_machine SET painted_at=?,updated_at=? WHERE id=?", (painted_at, utc_now(), machine_id))
+    add_audit("paint_complete", "production_machine", str(machine_id), {"painted_at": painted_at}, operator_name)
+    db.commit()
+
+
+def mark_machine_painted_by_serial(product_serial, painted_at, operator_name):
+    """Register paint completion from the serial number recorded on site."""
+    product_serial = validate_text(product_serial, "機台號碼")
+    sync_production_management()
+    machine = get_db().execute(
+        "SELECT * FROM production_machine WHERE product_serial=? COLLATE NOCASE",
+        (product_serial,),
+    ).fetchone()
+    if not machine:
+        raise ValueError("找不到已完成組裝的機台號碼，請先確認機台號碼與組裝完成狀態")
+    mark_machine_painted(machine["id"], painted_at, operator_name)
+    return machine
+
+
+def reassign_machine(assignment_id, new_order_line_id, operator_name, reason="改配"):
+    db = get_db()
+    assignment = db.execute("SELECT * FROM machine_assignment WHERE id=? AND unassigned_at IS NULL", (assignment_id,)).fetchone()
+    if not assignment:
+        raise ValueError("找不到有效配單")
+    machine_id = assignment["machine_id"]
+    machine = db.execute("SELECT model_id FROM production_machine WHERE id=?", (machine_id,)).fetchone()
+    line = db.execute("SELECT sol.*,so.order_no FROM sales_order_line sol JOIN sales_order so ON so.id=sol.order_id WHERE sol.id=? AND so.is_active=1", (new_order_line_id,)).fetchone()
+    if not line:
+        raise ValueError("找不到有效訂單明細")
+    if machine["model_id"] != line["model_id"]:
+        raise ValueError("製號機型與訂單需求機型不一致")
+    assigned_qty = db.execute(
+        "SELECT COUNT(*) FROM machine_assignment WHERE order_line_id=? AND unassigned_at IS NULL",
+        (new_order_line_id,),
+    ).fetchone()[0]
+    if new_order_line_id != assignment["order_line_id"] and assigned_qty >= line["required_qty"]:
+        raise ValueError("\u6b64\u9700\u6c42\u55ae\u660e\u7d30\u5df2\u5b8c\u6210\u914d\u55ae\uff0c\u4e0d\u53ef\u8d85\u984d\u914d\u7f6e")
+    # Finish the prior assignment and create the new one in one transaction.
+    now = utc_now()
+    db.execute("UPDATE machine_assignment SET unassigned_at=?,unassigned_reason=? WHERE id=?", (now, (reason or "改配").strip(), assignment_id))
+    cursor = db.execute("INSERT INTO machine_assignment(machine_id,order_line_id,assigned_at,assigned_by) VALUES(?,?,?,?)", (machine_id, new_order_line_id, now, operator_name or "admin"))
+    add_audit("reassign", "production_machine", str(machine_id), {"old_assignment_id": assignment_id, "new_assignment_id": cursor.lastrowid, "new_order_line_id": new_order_line_id, "order_no": line["order_no"]}, operator_name)
+    db.commit()
+
+
 def create_batch(model_id, manufacturing_year, starting_number, product_count, operator_name, assembly_stage=None):
     try:
         manufacturing_year = int(manufacturing_year)
@@ -650,6 +1128,8 @@ def scan(payload, operator_name="scanner"):
                 else:
                     result, message = "invalid", "此批次已取消或沒有可完成的產品"
             db.execute("INSERT INTO scan_event(event_id,payload,barcode_type,job_run_id,result,message,scanned_at,operator_name) VALUES(?,?,?,?,?,?,?,?)", (event_id, payload, kind, None, result, message, scanned_at, operator_name))
+            if result == "success" and kind == "FINISH":
+                sync_production_management()
             db.commit()
             return {"event_id": event_id, "result": result, "message": message, "scanned_at": scanned_at}
 
@@ -678,6 +1158,8 @@ def scan(payload, operator_name="scanner"):
     except ValueError as exc:
         result, message = "invalid", str(exc)
         db.execute("INSERT INTO scan_event(event_id,payload,result,message,scanned_at,operator_name) VALUES(?,?,?,?,?,?)", (event_id, payload, result, message, scanned_at, operator_name))
+    if result == "success" and kind == "FINISH":
+        sync_production_management()
     db.commit()
     return {"event_id": event_id, "result": result, "message": message, "scanned_at": scanned_at}
 

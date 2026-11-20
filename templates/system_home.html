@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block head %}<link rel="stylesheet" href="{{ url_for('static', filename='system_home.css') }}">{% endblock %}
+{% block content %}
+<section class="system-home system-selector">
+  <div class="system-home-intro">
+    <p class="eyebrow">INTJR 生產管理</p>
+    <h1>選擇系統</h1>
+    <p>依現場工作選擇入口。</p>
+  </div>
+  <div class="system-choice-grid">
+    <a class="system-choice assembly-choice" href="{{ url_for('main.assembly_home') }}">
+      <span class="system-choice-no">組裝系統</span>
+      <h2>組裝作業</h2>
+      <p>建立組裝報工、列印條碼、掃描 START／FINISH，並查看工時與報表。</p>
+      <span class="system-choice-action">進入組裝系統 →</span>
+    </a>
+    <a class="system-choice assignment-choice" href="{{ url_for('main.assignment_home') }}">
+      <span class="system-choice-no">配單系統</span>
+      <h2>訂單配單</h2>
+      <p>輸入需求單、登記噴漆完成入庫，並確認對應機台的配單狀態。</p>
+      <span class="system-choice-action">進入配單系統 →</span>
+    </a>
+  </div>
+</section>
+{% endblock %}

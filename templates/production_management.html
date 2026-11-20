@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="page-heading"><p class="eyebrow">配單系統</p><h1>入庫機台紀錄</h1></section>
+
+<section class="panel">
+  <h2>噴漆完成登記</h2>
+  <p class="muted">請輸入或掃描在噴漆室抄下的機台號碼。系統只接受已在組裝系統完成的機台，並自動帶出機型後入庫。</p>
+  <form method="post" action="{{ url_for('main.machine_paint_complete_by_serial') }}" class="paint-registration-form">
+    <input type="hidden" name="model_id" value="{{ selected_model_id or '' }}">
+    <label>機台號碼
+      <input name="product_serial" placeholder="例如：E27-01" autocomplete="off" required autofocus>
+    </label>
+    <label>噴漆完成日期
+      <input type="date" name="painted_at" value="{{ today }}" required>
+    </label>
+    <button class="button primary">登記入庫</button>
+  </form>
+</section>
+
+<section class="panel">
+  <form method="get" class="filters">
+    <label>機型
+      <select name="model_id">
+        <option value="">請選擇有庫存的機型</option>
+        {% for model in stock_models %}<option value="{{ model.model_id }}" {% if selected_model_id == model.model_id %}selected{% endif %}>{{ model.model_name_snapshot }}（{{ model.available_count }} 台）</option>{% endfor %}
+      </select>
+    </label>
+    <button class="button primary">套用篩選</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>已入庫未配單機台</h2>
+  <p class="muted">此處僅供查看可用庫存。需要配單時，請先從需求單清單選擇訂單後進入配單。</p>
+  {% if not selected_model_id %}<p class="empty">請先從上方選擇有庫存的機型，再查看入庫明細。</p>
+  {% elif inventory_summary %}<div class="cards inventory-summary">{% for row in inventory_summary %}<div class="stat"><span>{{ row.model_name_snapshot }}</span><strong>{{ row.available_count }} 台</strong><small>已入庫、尚未配單</small></div>{% endfor %}</div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>機型</th><th>製號</th><th>入庫日期</th></tr></thead>
+    <tbody>{% for machine in available_machines %}<tr>
+      <td>{{ machine.model_name_snapshot }}</td>
+      <td>{{ machine.product_serial }}</td>
+      <td>{{ machine.painted_at }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}<p class="empty">此機型目前沒有已入庫且尚未配單的機台。</p>{% endif %}
+</section>
+{% endblock %}

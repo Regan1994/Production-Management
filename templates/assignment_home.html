@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+{% block head %}<link rel="stylesheet" href="{{ url_for('static', filename='system_home.css') }}">{% endblock %}
+{% block content %}
+<section class="system-home">
+  <div class="system-home-intro">
+    <p class="eyebrow">配單系統</p>
+    <h1>選擇工作</h1>
+    <p>依目前要處理的工作進入對應頁面。</p>
+  </div>
+  <div class="system-choice-grid assignment-work-grid">
+    <a class="system-choice assignment-choice" href="{{ url_for('main.order_new') }}">
+      <span class="system-choice-no">01</span><h2>新訂單建立</h2><p>依業務提供的需求單，輸入訂單號、機型與需求台數。</p><span class="system-choice-action">建立訂單 →</span>
+    </a>
+    <a class="system-choice assignment-choice" href="{{ url_for('main.orders') }}">
+      <span class="system-choice-no">02</span><h2>訂單配單</h2><p>查看待配訂單、完成配單，並查詢已配完或已取消歷史。</p><span class="system-choice-action">進入訂單配單 →</span>
+    </a>
+    <a class="system-choice assignment-choice" href="{{ url_for('main.production_management') }}">
+      <span class="system-choice-no">03</span><h2>入庫機台紀錄</h2><p>登記噴漆完成入庫，並查看尚未配單的可用機台。</p><span class="system-choice-action">查看入庫機台 →</span>
+    </a>
+  </div>
+</section>
+{% endblock %}

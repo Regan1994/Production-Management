@@ -1,0 +1,48 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">訂單配單</p>
+    <h1>{{ order.order_no }}</h1>
+    <p>{{ order.customer_name or '未填客戶名稱' }}{% if order.expected_ship_date %}・預計出貨 {{ order.expected_ship_date }}{% endif %}</p>
+  </div>
+  <a class="button" href="{{ url_for('main.orders') }}">回訂單總表</a>
+</section>
+
+{% for line in lines %}
+{% set machines = available_by_model[line.model_id] %}
+<section class="panel order-assignment-line">
+  <div class="order-assignment-heading">
+    <div><h2>{{ line.model_name }}</h2><p class="muted">需求 {{ line.required_qty }} 台・已配 {{ line.assigned_qty }} 台・尚缺 {{ line.unassigned_qty }} 台</p></div>
+    <strong class="stock-count">可用庫存 {{ machines|length }} 台</strong>
+  </div>
+  {% if line.unassigned_qty == 0 %}
+  <p class="empty">此機型已完成配單。</p>
+  {% elif machines %}
+  <form method="post" action="{{ url_for('main.order_line_assign', order_id=order.id, line_id=line.id) }}">
+    <p class="muted">勾選要配給此訂單的機台；最多可選 {{ line.unassigned_qty }} 台。</p>
+    <div class="assignment-machine-list">
+      {% for machine in machines %}<label class="assignment-machine"><input type="checkbox" name="machine_id" value="{{ machine.id }}"> <span>{{ machine.product_serial }}</span><small>入庫：{{ machine.painted_at }}</small></label>{% endfor %}
+    </div>
+    <button class="button primary">確認配單</button>
+    {% set auto_machines = machines[:line.unassigned_qty] %}
+    <button type="button" class="button auto-assignment-trigger" data-dialog-id="auto-assignment-{{ line.id }}">自動配單</button>
+  </form>
+  <dialog id="auto-assignment-{{ line.id }}" class="assignment-dialog">
+    <h2>確認自動配單</h2>
+    <p>系統將 {{ auto_machines|length }} 台 {{ line.model_name }} 配給需求單 {{ order.order_no }}：</p>
+    <ul>{% for machine in auto_machines %}<li>{{ machine.product_serial }}（入庫：{{ machine.painted_at }}）</li>{% endfor %}</ul>
+    <form method="post" action="{{ url_for('main.order_line_assign', order_id=order.id, line_id=line.id) }}" class="dialog-actions">
+      {% for machine in auto_machines %}<input type="hidden" name="machine_id" value="{{ machine.id }}">{% endfor %}
+      <button class="button primary">確認配單</button>
+      <button type="button" class="button dialog-close">取消</button>
+    </form>
+  </dialog>
+  {% else %}
+  <p class="empty">目前沒有 {{ line.model_name }} 的可用庫存。</p>
+  {% endif %}
+</section>
+{% else %}
+<section class="panel"><p class="empty">此需求單尚未輸入機型需求。</p></section>
+{% endfor %}
+{% endblock %}

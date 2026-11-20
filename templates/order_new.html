@@ -1,0 +1,5 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="page-heading"><p class="eyebrow">配單系統</p><h1>新建訂單</h1></section>
+<section class="panel"><h2>輸入需求單</h2><form method="post"><div class="order-header-entry"><label>訂單號碼<input name="order_no" required></label><label>客戶名稱<input name="customer_name"></label><label>預計出貨日<input type="date" name="expected_ship_date"></label></div><p class="muted">手動選擇機型與需求台數。同一張訂單可輸入多個機型；選擇機型時，需求台數會先帶入 1 台。</p><div class="order-line-entry">{% for _ in range(3) %}<div class="order-line-row"><label>機型<select name="model_id" data-default-quantity="order-qty-{{ loop.index }}"><option value="">暫不填寫</option>{% for model in models %}<option value="{{ model.id }}">{{ model.model_name }}</option>{% endfor %}</select></label><label>需求台數<input id="order-qty-{{ loop.index }}" type="number" name="required_qty" min="1"></label></div>{% endfor %}</div><button class="button primary">儲存需求單</button></form></section>
+{% endblock %}
